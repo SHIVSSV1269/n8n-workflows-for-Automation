@@ -1,0 +1,294 @@
+{
+  "name": "Price Comparison - AI",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "price-compare",
+        "formTitle": "Where should I buy this?",
+        "formDescription": "Compares live prices across Amazon, Flipkart, Croma, Reliance Digital and Vijay Sales, then tells you where to buy.",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "Product",
+              "placeholder": "e.g. Sony WH-1000XM5",
+              "requiredField": true
+            },
+            {
+              "fieldLabel": "Budget",
+              "fieldType": "number",
+              "placeholder": "Optional. Max you want to spend, in rupees."
+            },
+            {
+              "fieldLabel": "Preferences",
+              "fieldType": "textarea",
+              "placeholder": "Optional. e.g. 'must be 256GB', 'needs to arrive by Friday', 'avoid third-party sellers'"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [-900, 0],
+      "id": "b7c8d9e0-0001-4000-8000-000000000001",
+      "name": "Product Search Form",
+      "webhookId": "b7c8d9e0-aaaa-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------\n// EDIT HERE: the retailers to compare, and the scraping proxy.\n// ---------------------------------------------------------------\n\n// Optional but strongly recommended. Amazon and Flipkart return a CAPTCHA\n// page to datacenter IPs, so a direct fetch usually yields nothing usable.\n//\n// The key is read from the environment, never stored in this file, so this\n// workflow is safe to commit and share. Set it before starting n8n:\n//   cmd:         set SCRAPER_API_KEY=your_key\n//   PowerShell:  $env:SCRAPER_API_KEY = 'your_key'\n// Unset means fetch directly -- the smaller retailers still work.\nconst SCRAPER_API_KEY = (() => {\n  try {\n    return String($env.SCRAPER_API_KEY || '').trim();\n  } catch (e) {\n    // env access is off (N8N_BLOCK_ENV_ACCESS_IN_NODE=true)\n    return '';\n  }\n})();\n\n// Add or remove sites freely. {q} is replaced with the URL-encoded query.\nconst SITES = [\n  { site: 'Amazon.in',         url: 'https://www.amazon.in/s?k={q}' },\n  { site: 'Flipkart',          url: 'https://www.flipkart.com/search?q={q}' },\n  { site: 'Croma',             url: 'https://www.croma.com/searchB?q={q}%3Arelevance' },\n  { site: 'Reliance Digital',  url: 'https://www.reliancedigital.in/search?q={q}%3Arelevance' },\n  { site: 'Vijay Sales',       url: 'https://www.vijaysales.com/search/{q}' },\n];\n\n// ---------------------------------------------------------------\n\nconst form = $input.first().json;\nconst query = String(form.Product || '').trim();\nif (!query) {\n  throw new Error('No product was submitted.');\n}\n\nconst encoded = encodeURIComponent(query);\n\nreturn SITES.map((s) => {\n  const searchUrl = s.url.replace('{q}', encoded);\n\n  // Route through the proxy when a key is present, otherwise go direct.\n  // render=true executes JavaScript, which Flipkart and Croma need.\n  const fetchUrl = SCRAPER_API_KEY\n    ? 'https://api.scraperapi.com/?api_key=' +\n      SCRAPER_API_KEY +\n      '&country_code=in&render=true&url=' +\n      encodeURIComponent(searchUrl)\n    : searchUrl;\n\n  return {\n    json: {\n      site: s.site,\n      query,\n      budget: form.Budget || null,\n      preferences: form.Preferences || '',\n      searchUrl,\n      fetchUrl,\n      viaProxy: Boolean(SCRAPER_API_KEY),\n    },\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-680, 0],
+      "id": "b7c8d9e0-0002-4000-8000-000000000002",
+      "name": "Prepare Site Requests"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.fetchUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            },
+            {
+              "name": "Accept",
+              "value": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+            },
+            {
+              "name": "Accept-Language",
+              "value": "en-IN,en;q=0.9"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 45000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true
+            }
+          },
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "html"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [-460, 0],
+      "id": "b7c8d9e0-0003-4000-8000-000000000003",
+      "name": "Fetch Each Site",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Strip each page down to plain text so the model reads content, not markup.\n// This is deliberately dumb -- no CSS selectors to break when a site redesigns.\nconst sites = $('Prepare Site Requests').all();\nconst responses = $input.all();\n\nconst MAX_CHARS = 12000;\n\nconst out = [];\nfor (let i = 0; i < responses.length; i++) {\n  const meta = sites[i] ? sites[i].json : {};\n  const body = responses[i].json;\n\n  if (body.error || !body.html) {\n    out.push({\n      json: {\n        site: meta.site,\n        searchUrl: meta.searchUrl,\n        ok: false,\n        reason: 'request failed (blocked, timed out, or refused)',\n        text: '',\n      },\n    });\n    continue;\n  }\n\n  const text = String(body.html)\n    .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n    .replace(/<noscript[\\s\\S]*?<\\/noscript>/gi, ' ')\n    .replace(/<svg[\\s\\S]*?<\\/svg>/gi, ' ')\n    .replace(/<!--[\\s\\S]*?-->/g, ' ')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/&nbsp;/gi, ' ')\n    .replace(/&amp;/gi, '&')\n    .replace(/&#8377;|&#x20B9;|&rupee;/gi, 'Rs.')\n    .replace(/\\s+/g, ' ')\n    .trim();\n\n  const looksBlocked =\n    /captcha|are you a robot|unusual traffic|access denied|enable javascript to continue/i.test(\n      text.slice(0, 3000)\n    ) || text.length < 500;\n\n  out.push({\n    json: {\n      site: meta.site,\n      searchUrl: meta.searchUrl,\n      ok: !looksBlocked,\n      reason: looksBlocked ? 'page was blocked, empty, or JS-only' : '',\n      text: text.slice(0, MAX_CHARS),\n    },\n  });\n}\n\nreturn out;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 0],
+      "id": "b7c8d9e0-0004-4000-8000-000000000004",
+      "name": "HTML to Text"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Retailer: {{ $json.site }}\nShopper is looking for: {{ $('Prepare Site Requests').first().json.query }}\nFetch status: {{ $json.ok ? 'ok' : 'FAILED - ' + $json.reason }}\n\n--- PAGE TEXT ---\n{{ $json.text }}\n--- END PAGE TEXT ---",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You read the raw text of a retailer's search-results page and pull out the products that actually match what the shopper asked for.\n\nRules:\n- Return at most 3 products, best match first.\n- Only return products that are plausibly the item the shopper asked for. Accessories, cases, cables, and unrelated items from the \"you may also like\" rail are not matches. If nothing on the page matches, set found to false and return an empty list.\n- price is the current selling price as a plain number, no currency symbol, no commas. mrp is the struck-through original price if one is shown.\n- If a value is genuinely not on the page, use null. Never guess, never estimate, never carry a number over from a different product. A null is far more useful than an invented figure.\n- Page text is scraped and messy: prices may appear split across fragments, and unrelated numbers (ratings, review counts, EMI amounts, offer percentages) sit right next to them. Only treat a number as the price if the surrounding text makes it clearly the price of that product.\n- If the fetch status says FAILED, or the text is a CAPTCHA or cookie wall rather than product listings, set found to false and say so in note.\n\nBe accurate over complete. This feeds a buying decision, and a wrong price is worse than a missing one."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [-20, 0],
+      "id": "b7c8d9e0-0005-4000-8000-000000000005",
+      "name": "Extract Products"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-opus-5",
+          "mode": "list",
+          "cachedResultName": "Claude Opus 5"
+        },
+        "options": {
+          "maxTokensToSample": 2000
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [-80, 220],
+      "id": "b7c8d9e0-0006-4000-8000-000000000006",
+      "name": "Claude - Extractor"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"found\": {\n      \"type\": \"boolean\",\n      \"description\": \"True only if at least one genuinely matching product was found\"\n    },\n    \"note\": {\n      \"type\": \"string\",\n      \"description\": \"Short explanation if nothing was found, otherwise empty string\"\n    },\n    \"products\": {\n      \"type\": \"array\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"title\": { \"type\": \"string\" },\n          \"price\": { \"type\": [\"number\", \"null\"], \"description\": \"Current selling price as a plain number\" },\n          \"mrp\": { \"type\": [\"number\", \"null\"], \"description\": \"Struck-through original price if shown\" },\n          \"rating\": { \"type\": [\"number\", \"null\"], \"description\": \"Star rating out of 5\" },\n          \"reviewCount\": { \"type\": [\"number\", \"null\"] },\n          \"availability\": { \"type\": \"string\", \"description\": \"in stock, out of stock, or unknown\" },\n          \"note\": { \"type\": \"string\", \"description\": \"Anything relevant: variant, seller, bank offer, delivery claim\" }\n        },\n        \"required\": [\"title\", \"price\", \"availability\"]\n      }\n    }\n  },\n  \"required\": [\"found\", \"note\", \"products\"]\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [100, 220],
+      "id": "b7c8d9e0-0007-4000-8000-000000000007",
+      "name": "Product Schema"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Fold the five per-site extractions into one payload for the judging step.\nconst pages = $('HTML to Text').all();\nconst results = $input.all();\nconst form = $('Prepare Site Requests').first().json;\n\nconst offers = [];\nfor (let i = 0; i < results.length; i++) {\n  const page = pages[i] ? pages[i].json : {};\n\n  let parsed = results[i].json.output;\n  if (typeof parsed === 'string') {\n    try {\n      parsed = JSON.parse(parsed);\n    } catch (e) {\n      parsed = null;\n    }\n  }\n\n  offers.push({\n    site: page.site,\n    searchUrl: page.searchUrl,\n    fetched: Boolean(page.ok),\n    fetchNote: page.reason || '',\n    found: Boolean(parsed && parsed.found),\n    note: (parsed && parsed.note) || '',\n    products: (parsed && Array.isArray(parsed.products) ? parsed.products : []).filter(\n      (p) => p && typeof p.price === 'number' && p.price > 0\n    ),\n  });\n}\n\nconst withPrices = offers.filter((o) => o.products.length > 0);\n\nreturn [\n  {\n    json: {\n      query: form.query,\n      budget: form.budget,\n      preferences: form.preferences,\n      viaProxy: form.viaProxy,\n      sitesChecked: offers.length,\n      sitesWithPrices: withPrices.length,\n      offers,\n      comparedAt: new Date().toISOString(),\n    },\n  },\n];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [200, 0],
+      "id": "b7c8d9e0-0008-4000-8000-000000000008",
+      "name": "Collect Offers"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Shopper wants: {{ $json.query }}\nBudget: {{ $json.budget || 'not specified' }}\nPreferences: {{ $json.preferences || 'none given' }}\n\nRetailer data (JSON):\n{{ JSON.stringify($json.offers, null, 2) }}",
+        "hasOutputParser": true,
+        "messages": {
+          "messageValues": [
+            {
+              "message": "You advise a shopper in India on where to buy a product, given live listings scraped from several retailers.\n\nHow to decide:\n- Compare like with like. The cheapest listing is often a different variant, a smaller capacity, a renewed unit, or a bundle. If the products are not the same thing, say so rather than declaring a winner.\n- Price is the main factor, but not the only one. Weigh stock status, seller reliability, rating and review volume, and any delivery or warranty signal in the data.\n- A price far below the others is a red flag, not a bargain. Flag it.\n- Some retailers may have failed to return data. Say which ones, so the shopper knows the comparison is partial. Never fill the gap with a guess.\n- If a budget was given, say plainly whether it is achievable.\n- Set confidence to low when few sites returned data, when the matches look like different variants, or when prices are missing.\n\nWrite the verdict for someone about to spend their own money: direct, specific, two or three sentences. Lead with where to buy and what it costs. No hedging padding, no marketing tone."
+            }
+          ]
+        },
+        "batching": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chainLlm",
+      "typeVersion": 1.7,
+      "position": [420, 0],
+      "id": "b7c8d9e0-0009-4000-8000-000000000009",
+      "name": "Pick Best Deal"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "claude-opus-5",
+          "mode": "list",
+          "cachedResultName": "Claude Opus 5"
+        },
+        "options": {
+          "maxTokensToSample": 2000
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
+      "typeVersion": 1.3,
+      "position": [360, 220],
+      "id": "b7c8d9e0-0010-4000-8000-000000000010",
+      "name": "Claude - Judge"
+    },
+    {
+      "parameters": {
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"bestSite\": { \"type\": \"string\", \"description\": \"Retailer to buy from, or 'inconclusive'\" },\n    \"bestPrice\": { \"type\": [\"number\", \"null\"] },\n    \"bestProduct\": { \"type\": \"string\", \"description\": \"Exact title of the recommended listing\" },\n    \"verdict\": { \"type\": \"string\", \"description\": \"Two or three sentences of advice\" },\n    \"confidence\": { \"type\": \"string\", \"description\": \"high, medium, or low\" },\n    \"withinBudget\": { \"type\": [\"boolean\", \"null\"], \"description\": \"Null if no budget was given\" },\n    \"ranking\": {\n      \"type\": \"array\",\n      \"description\": \"Every site that returned a usable price, cheapest first\",\n      \"items\": {\n        \"type\": \"object\",\n        \"properties\": {\n          \"site\": { \"type\": \"string\" },\n          \"price\": { \"type\": [\"number\", \"null\"] },\n          \"product\": { \"type\": \"string\" },\n          \"note\": { \"type\": \"string\", \"description\": \"Variant difference, stock, seller, or offer worth knowing\" }\n        },\n        \"required\": [\"site\", \"price\", \"product\", \"note\"]\n      }\n    },\n    \"warnings\": {\n      \"type\": \"array\",\n      \"description\": \"Suspicious pricing, variant mismatches, stock risks. Empty if none.\",\n      \"items\": { \"type\": \"string\" }\n    },\n    \"noDataFrom\": {\n      \"type\": \"array\",\n      \"description\": \"Retailers that returned nothing usable\",\n      \"items\": { \"type\": \"string\" }\n    }\n  },\n  \"required\": [\"bestSite\", \"bestPrice\", \"bestProduct\", \"verdict\", \"confidence\", \"ranking\", \"warnings\", \"noDataFrom\"]\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.outputParserStructured",
+      "typeVersion": 1.2,
+      "position": [540, 220],
+      "id": "b7c8d9e0-0011-4000-8000-000000000011",
+      "name": "Verdict Schema"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Turn the verdict into the page the shopper sees when the form completes.\nconst ctx = $('Collect Offers').first().json;\n\nlet v = $input.first().json.output;\nif (typeof v === 'string') {\n  try {\n    v = JSON.parse(v);\n  } catch (e) {\n    v = null;\n  }\n}\nif (!v) {\n  return [\n    {\n      json: {\n        title: 'Could not compare',\n        html: '<p>The retailers did not return usable data this time. Try a more specific product name, or add a scraping proxy key in the <b>Prepare Site Requests</b> node.</p>',\n      },\n    },\n  ];\n}\n\nconst esc = (x) =>\n  String(x == null ? '' : x)\n    .replace(/&/g, '&amp;')\n    .replace(/</g, '&lt;')\n    .replace(/>/g, '&gt;');\n\nconst rupees = (n) =>\n  typeof n === 'number' ? 'Rs. ' + n.toLocaleString('en-IN') : 'not listed';\n\nconst urlFor = (site) => {\n  const hit = ctx.offers.find((o) => o.site === site);\n  return hit ? hit.searchUrl : '';\n};\n\nconst confColor =\n  v.confidence === 'high' ? '#137333' : v.confidence === 'medium' ? '#b06000' : '#c5221f';\n\nconst rows = (v.ranking || [])\n  .map((r, i) => {\n    const link = urlFor(r.site);\n    const name = link\n      ? '<a href=\"' + esc(link) + '\" style=\"color:#1a56db;text-decoration:none;\">' + esc(r.site) + '</a>'\n      : esc(r.site);\n    const bg = i === 0 ? 'background:#e8f5e9;' : '';\n    return (\n      '<tr style=\"' + bg + '\">' +\n      '<td style=\"padding:10px 12px;border-bottom:1px solid #e8eaed;font-weight:600;\">' + name + '</td>' +\n      '<td style=\"padding:10px 12px;border-bottom:1px solid #e8eaed;white-space:nowrap;font-weight:600;\">' + rupees(r.price) + '</td>' +\n      '<td style=\"padding:10px 12px;border-bottom:1px solid #e8eaed;font-size:13px;color:#3c4043;\">' + esc(r.product) +\n      (r.note ? '<div style=\"color:#5f6368;font-size:12px;margin-top:3px;\">' + esc(r.note) + '</div>' : '') +\n      '</td></tr>'\n    );\n  })\n  .join('');\n\nconst warnings = (v.warnings || []).length\n  ? '<div style=\"background:#fef7e0;border-left:3px solid #f9ab00;padding:10px 14px;margin:16px 0;border-radius:4px;\">' +\n    '<div style=\"font-weight:600;font-size:13px;margin-bottom:4px;\">Worth checking</div>' +\n    '<ul style=\"margin:0;padding-left:18px;font-size:13px;color:#3c4043;\">' +\n    v.warnings.map((w) => '<li>' + esc(w) + '</li>').join('') +\n    '</ul></div>'\n  : '';\n\nconst missing = (v.noDataFrom || []).length\n  ? '<p style=\"font-size:12px;color:#5f6368;margin-top:14px;\">No usable data from: ' +\n    v.noDataFrom.map(esc).join(', ') +\n    '. This comparison is partial.</p>'\n  : '';\n\nconst budgetLine =\n  v.withinBudget === null || v.withinBudget === undefined\n    ? ''\n    : '<p style=\"font-size:13px;color:' + (v.withinBudget ? '#137333' : '#c5221f') + ';margin:6px 0 0;\">' +\n      (v.withinBudget ? 'Within your budget.' : 'Over your budget.') +\n      '</p>';\n\nconst html =\n  '<div style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;max-width:680px;\">' +\n  '<div style=\"background:#f1f3f4;border-radius:8px;padding:16px;margin-bottom:6px;\">' +\n  '<div style=\"font-size:13px;color:#5f6368;\">Best place to buy</div>' +\n  '<div style=\"font-size:22px;font-weight:700;margin:4px 0;\">' + esc(v.bestSite) + ' &mdash; ' + rupees(v.bestPrice) + '</div>' +\n  '<div style=\"font-size:14px;color:#3c4043;\">' + esc(v.bestProduct) + '</div>' +\n  budgetLine +\n  '</div>' +\n  '<p style=\"font-size:15px;line-height:1.55;color:#202124;\">' + esc(v.verdict) + '</p>' +\n  warnings +\n  '<table style=\"width:100%;border-collapse:collapse;margin-top:8px;font-size:14px;\">' +\n  '<thead><tr style=\"text-align:left;color:#5f6368;font-size:12px;text-transform:uppercase;\">' +\n  '<th style=\"padding:6px 12px;\">Retailer</th><th style=\"padding:6px 12px;\">Price</th><th style=\"padding:6px 12px;\">Listing</th>' +\n  '</tr></thead><tbody>' + rows + '</tbody></table>' +\n  missing +\n  '<p style=\"font-size:12px;color:#80868b;margin-top:16px;\">' +\n  'Checked ' + ctx.sitesChecked + ' retailers, ' + ctx.sitesWithPrices + ' returned prices. ' +\n  'Confidence: <span style=\"color:' + confColor + ';font-weight:600;\">' + esc(v.confidence) + '</span>. ' +\n  'Prices change constantly &mdash; confirm on the retailer page before paying.</p>' +\n  '</div>';\n\nreturn [{ json: { title: 'Results for \"' + ctx.query + '\"', html, verdict: v } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 0],
+      "id": "b7c8d9e0-0012-4000-8000-000000000012",
+      "name": "Render Result"
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "respondWith": "showText",
+        "completionTitle": "={{ $json.title }}",
+        "completionMessage": "={{ $json.html }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 1,
+      "position": [860, 0],
+      "id": "b7c8d9e0-0013-4000-8000-000000000013",
+      "name": "Show Comparison",
+      "webhookId": "b7c8d9e0-bbbb-4000-8000-000000000013"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Product Search Form": {
+      "main": [[{ "node": "Prepare Site Requests", "type": "main", "index": 0 }]]
+    },
+    "Prepare Site Requests": {
+      "main": [[{ "node": "Fetch Each Site", "type": "main", "index": 0 }]]
+    },
+    "Fetch Each Site": {
+      "main": [[{ "node": "HTML to Text", "type": "main", "index": 0 }]]
+    },
+    "HTML to Text": {
+      "main": [[{ "node": "Extract Products", "type": "main", "index": 0 }]]
+    },
+    "Claude - Extractor": {
+      "ai_languageModel": [
+        [{ "node": "Extract Products", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "Product Schema": {
+      "ai_outputParser": [
+        [{ "node": "Extract Products", "type": "ai_outputParser", "index": 0 }]
+      ]
+    },
+    "Extract Products": {
+      "main": [[{ "node": "Collect Offers", "type": "main", "index": 0 }]]
+    },
+    "Collect Offers": {
+      "main": [[{ "node": "Pick Best Deal", "type": "main", "index": 0 }]]
+    },
+    "Claude - Judge": {
+      "ai_languageModel": [
+        [{ "node": "Pick Best Deal", "type": "ai_languageModel", "index": 0 }]
+      ]
+    },
+    "Verdict Schema": {
+      "ai_outputParser": [
+        [{ "node": "Pick Best Deal", "type": "ai_outputParser", "index": 0 }]
+      ]
+    },
+    "Pick Best Deal": {
+      "main": [[{ "node": "Render Result", "type": "main", "index": 0 }]]
+    },
+    "Render Result": {
+      "main": [[{ "node": "Show Comparison", "type": "main", "index": 0 }]]
+    },
+    "Show Comparison": {
+      "main": [[]]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
