@@ -3,8 +3,6 @@
 Give it a product name. It checks five Indian retailers at once,
 reads every result page with an LLM, and tells you where to buy.
 
-## 📸 Preview
-[Add your results-page screenshot here]
 
 ## ⚙️ How It Works
 1. Form Trigger takes the product, an optional budget, and preferences
