@@ -14,12 +14,14 @@ with Lego blocks where each block is an app or action.
 |---|---|---|
 | [Internship Scanner](internship-scanner) | Scans Internshala every 2hrs, sends Telegram alerts | ✅ Live |
 | [AI Price Comparison](price-comparison) | Checks 5 retailers for a product, LLM picks the best place to buy | 🧪 Built |
+| [Dev Daily Briefing](dev-briefing) | HN, GitHub, weather and exchange rates merged into one live dashboard, no API keys | ✅ Live |
 | Coming soon... | More workflows in progress | 🔄 |
 
 ## 🛠️ Tech Stack
 - n8n (workflow engine)
 - LLM-based extraction and decision-making
 - Telegram Bot API
+- Public REST APIs (Hacker News, GitHub, Open-Meteo)
 - JavaScript
 - HTML scraping
 - REST APIs

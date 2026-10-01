@@ -1,0 +1,454 @@
+{
+  "name": "Dev Daily Briefing",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "dev-briefing",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -1000,
+        300
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000001",
+      "name": "Briefing Webhook",
+      "webhookId": "d3b1e000-aaaa-4000-8000-000000000001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Every setting can be overridden by query string:\n//   /webhook/dev-briefing?city=Bangalore&lat=12.97&lon=77.59&topics=ai,rust&base=EUR\nconst q = $input.first().json.query || {};\n\nconst city = {\n  name: q.city || 'Chennai',\n  lat: Number(q.lat) || 13.0827,\n  lon: Number(q.lon) || 80.2707,\n};\nconst keywords = String(q.topics || 'ai,llm,python,java,security,startup,open source,database,linux')\n  .split(',').map((s) => s.trim().toLowerCase()).filter(Boolean);\nconst base = String(q.base || 'USD').toUpperCase().replace(/[^A-Z]/g, '').slice(0, 3) || 'USD';\nconst hnLimit = Math.min(Math.max(Number(q.hn) || 30, 5), 60);\nconst since = new Date(Date.now() - 7 * 864e5).toISOString().slice(0, 10);\n\nreturn [{\n  json: {\n    city, keywords, base, hnLimit, since,\n    weatherUrl:\n      'https://api.open-meteo.com/v1/forecast?latitude=' + city.lat + '&longitude=' + city.lon +\n      '&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m' +\n      '&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,weather_code' +\n      '&timezone=auto&forecast_days=3',\n    githubUrl:\n      'https://api.github.com/search/repositories?q=created:%3E' + since +\n      '&sort=stars&order=desc&per_page=10',\n    fxUrl: 'https://open.er-api.com/v6/latest/' + base,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -780,
+        300
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000002",
+      "name": "Config"
+    },
+    {
+      "parameters": {
+        "url": "https://hacker-news.firebaseio.com/v0/topstories.json",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "responseFormat": "text",
+              "outputPropertyName": "raw"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -540,
+        0
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000003",
+      "name": "HN Top Stories",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "// HN returns a bare array of ids. Parsed here rather than in the HTTP node,\n// because n8n splits JSON arrays inconsistently depending on element type.\nconst cfg = $('Config').first().json;\nconst body = $input.first().json;\n\nlet ids = [];\ntry {\n  ids = JSON.parse(body.raw || '[]');\n} catch (e) {\n  ids = [];\n}\n\n// Always emit at least one item so this branch still reaches the Merge node.\nif (!Array.isArray(ids) || ids.length === 0) {\n  return [{ json: { id: null } }];\n}\nreturn ids.slice(0, cfg.hnLimit).map((id) => ({ json: { id } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        0
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000004",
+      "name": "Pick Top Stories"
+    },
+    {
+      "parameters": {
+        "url": "=https://hacker-news.firebaseio.com/v0/item/{{ $json.id }}.json",
+        "options": {
+          "timeout": 20000,
+          "batching": {
+            "batch": {
+              "batchSize": 10,
+              "batchInterval": 100
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -100,
+        0
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000005",
+      "name": "Fetch Story",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Score = HN points, boosted for every one of your topics the title mentions.\nconst cfg = $('Config').first().json;\n\nconst stories = $input.all()\n  .map((i) => i.json)\n  .filter((s) => s && s.type === 'story' && s.title && !s.dead && !s.deleted)\n  .map((s) => {\n    const words = ' ' + s.title.toLowerCase().replace(/[^a-z0-9+#. ]/g, ' ') + ' ';\n    const matched = cfg.keywords.filter((k) => words.includes(' ' + k + ' '));\n    const points = s.score || 0;\n    return {\n      title: s.title,\n      url: s.url || 'https://news.ycombinator.com/item?id=' + s.id,\n      discuss: 'https://news.ycombinator.com/item?id=' + s.id,\n      points,\n      comments: s.descendants || 0,\n      matched,\n      rank: points * (1 + 0.75 * matched.length),\n    };\n  })\n  .sort((a, b) => b.rank - a.rank);\n\nreturn [{\n  json: {\n    section: 'hn',\n    ok: stories.length > 0,\n    reason: stories.length ? '' : 'no stories returned',\n    forYou: stories.filter((s) => s.matched.length > 0).slice(0, 8),\n    top: stories.filter((s) => s.matched.length === 0).slice(0, 5),\n    scanned: stories.length,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        0
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000006",
+      "name": "Rank Stories"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.githubUrl }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "n8n-dev-briefing"
+            },
+            {
+              "name": "Accept",
+              "value": "application/vnd.github+json"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -540,
+        200
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000007",
+      "name": "GitHub Rising Repos",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\n\nif (r.error || !Array.isArray(r.items)) {\n  return [{ json: { section: 'github', ok: false, reason: (r.error && r.error.message) || r.message || 'no data', repos: [] } }];\n}\n\nreturn [{\n  json: {\n    section: 'github',\n    ok: true,\n    since: $('Config').first().json.since,\n    repos: r.items.slice(0, 8).map((x) => ({\n      name: x.full_name,\n      url: x.html_url,\n      description: (x.description || '').slice(0, 140),\n      stars: x.stargazers_count,\n      language: x.language || 'n/a',\n    })),\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        200
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000008",
+      "name": "Shape Repos"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.weatherUrl }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -540,
+        400
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000009",
+      "name": "Weather Forecast",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "const w = $input.first().json;\nconst cfg = $('Config').first().json;\n\nconst WMO = {\n  0: 'Clear', 1: 'Mainly clear', 2: 'Partly cloudy', 3: 'Overcast',\n  45: 'Fog', 48: 'Fog', 51: 'Light drizzle', 53: 'Drizzle', 55: 'Heavy drizzle',\n  61: 'Light rain', 63: 'Rain', 65: 'Heavy rain', 66: 'Freezing rain', 67: 'Freezing rain',\n  71: 'Light snow', 73: 'Snow', 75: 'Heavy snow', 80: 'Showers', 81: 'Showers', 82: 'Violent showers',\n  95: 'Thunderstorm', 96: 'Thunderstorm, hail', 99: 'Thunderstorm, hail',\n};\nconst label = (c) => WMO[c] || 'Unknown';\n\nif (w.error || !w.current || !w.daily) {\n  return [{ json: { section: 'weather', ok: false, city: cfg.city.name, reason: (w.error && w.error.message) || 'no data' } }];\n}\n\nconst days = w.daily.time.map((d, i) => ({\n  date: d,\n  max: w.daily.temperature_2m_max[i],\n  min: w.daily.temperature_2m_min[i],\n  rain: w.daily.precipitation_probability_max[i],\n  sky: label(w.daily.weather_code[i]),\n}));\n\nconst alerts = [];\nif (days.some((d) => d.rain >= 70)) alerts.push('High chance of rain in the next 3 days - carry an umbrella.');\nif (w.current.apparent_temperature >= 38) alerts.push('Feels like ' + w.current.apparent_temperature + ' C right now - stay hydrated.');\n\nreturn [{\n  json: {\n    section: 'weather',\n    ok: true,\n    city: cfg.city.name,\n    now: {\n      temp: w.current.temperature_2m,\n      feels: w.current.apparent_temperature,\n      humidity: w.current.relative_humidity_2m,\n      wind: w.current.wind_speed_10m,\n      sky: label(w.current.weather_code),\n    },\n    days,\n    alerts,\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        400
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000010",
+      "name": "Shape Weather"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.fxUrl }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        -540,
+        600
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000011",
+      "name": "Exchange Rates",
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "const r = $input.first().json;\nconst base = $('Config').first().json.base;\nconst WANT = ['INR', 'USD', 'EUR', 'GBP', 'JPY', 'AED', 'SGD'].filter((c) => c !== base);\n\nif (r.error || r.result !== 'success' || !r.rates) {\n  return [{ json: { section: 'fx', ok: false, base, reason: (r.error && r.error.message) || r['error-type'] || 'no data' } }];\n}\n\nreturn [{\n  json: {\n    section: 'fx',\n    ok: true,\n    base,\n    updated: r.time_last_update_utc,\n    rates: WANT.filter((c) => r.rates[c] != null).map((c) => ({ code: c, rate: r.rates[c] })),\n  },\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        120,
+        600
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000012",
+      "name": "Shape Rates"
+    },
+    {
+      "parameters": {
+        "numberInputs": 4
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [
+        380,
+        280
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000013",
+      "name": "Merge Sections"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Merge appends all four branches; pick each one out by its section tag.\nconst parts = {};\nfor (const item of $input.all()) parts[item.json.section] = item.json;\nconst hn = parts.hn || {};\nconst github = parts.github || {};\nconst weather = parts.weather || {};\nconst fx = parts.fx || {};\nconst cfg = $('Config').first().json;\n\nconst esc = (v) => String(v == null ? '' : v)\n  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\nconst down = (name, why) => '<p class=\"muted\">' + esc(name) + ' unavailable right now (' + esc(why || 'no data') + ').</p>';\n\nconst story = (s) =>\n  '<li><a href=\"' + esc(s.url) + '\">' + esc(s.title) + '</a>' +\n  '<div class=\"meta\">' + s.points + ' pts &middot; <a href=\"' + esc(s.discuss) + '\">' + s.comments + ' comments</a>' +\n  (s.matched.length ? ' &middot; ' + s.matched.map((m) => '<span class=\"tag\">' + esc(m) + '</span>').join(' ') : '') +\n  '</div></li>';\n\nconst hnHtml = hn.ok\n  ? '<h3>Matching your topics</h3>' +\n    (hn.forYou.length ? '<ol>' + hn.forYou.map(story).join('') + '</ol>' : '<p class=\"muted\">Nothing on the front page matches your topics right now.</p>') +\n    '<h3>Also trending</h3><ol>' + hn.top.map(story).join('') + '</ol>' +\n    '<p class=\"muted\">Ranked ' + hn.scanned + ' front-page stories.</p>'\n  : down('Hacker News', hn.reason);\n\nconst ghHtml = github.ok\n  ? '<ol>' + github.repos.map((r) =>\n      '<li><a href=\"' + esc(r.url) + '\">' + esc(r.name) + '</a> <span class=\"tag\">' + esc(r.language) + '</span>' +\n      '<div class=\"meta\">&#9733; ' + r.stars.toLocaleString('en-IN') + ' &middot; ' + esc(r.description) + '</div></li>'\n    ).join('') + '</ol><p class=\"muted\">Repos created since ' + esc(github.since) + ', ranked by stars.</p>'\n  : down('GitHub', github.reason);\n\nconst wxHtml = weather.ok\n  ? '<div class=\"big\">' + Math.round(weather.now.temp) + '&deg;C <small>' + esc(weather.now.sky) + '</small></div>' +\n    '<div class=\"meta\">Feels ' + Math.round(weather.now.feels) + '&deg;C &middot; humidity ' + weather.now.humidity + '% &middot; wind ' + weather.now.wind + ' km/h</div>' +\n    '<table>' + weather.days.map((d) =>\n      '<tr><td>' + esc(new Date(d.date).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short' })) + '</td>' +\n      '<td>' + esc(d.sky) + '</td><td>' + Math.round(d.min) + '&ndash;' + Math.round(d.max) + '&deg;</td><td>' + d.rain + '% rain</td></tr>'\n    ).join('') + '</table>' +\n    weather.alerts.map((a) => '<div class=\"alert\">' + esc(a) + '</div>').join('')\n  : down('Weather', weather.reason);\n\nconst fxHtml = fx.ok\n  ? '<table>' + fx.rates.map((r) =>\n      '<tr><td>1 ' + esc(fx.base) + '</td><td>=</td><td><b>' + r.rate.toLocaleString('en-IN', { maximumFractionDigits: 4 }) + '</b> ' + esc(r.code) + '</td></tr>'\n    ).join('') + '</table><p class=\"muted\">Updated ' + esc(fx.updated) + '</p>'\n  : down('Exchange rates', fx.reason);\n\nconst now = new Date().toLocaleString('en-IN', { dateStyle: 'full', timeStyle: 'short' });\nconst healthy = [hn.ok, github.ok, weather.ok, fx.ok].filter(Boolean).length;\n\nconst html = '<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">' +\n'<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Dev Daily Briefing</title><style>' +\n':root{--bg:#f6f7f9;--card:#fff;--ink:#1f2328;--muted:#656d76;--line:#e4e7eb;--accent:#0969da;--tag:#ddf4ff;--warn:#fff8c5}' +\n'@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--ink:#e6edf3;--muted:#8d96a0;--line:#30363d;--accent:#4493f8;--tag:#0c2d6b;--warn:#3d2e00}}' +\n'*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}' +\n'header{max-width:1100px;margin:0 auto;padding:28px 16px 8px}h1{margin:0;font-size:24px}' +\n'.grid{max-width:1100px;margin:0 auto;padding:16px;display:grid;gap:16px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}' +\n'section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;min-width:0}.wide{grid-column:1/-1}' +\n'h2{margin:0 0 10px;font-size:16px}h3{margin:14px 0 6px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}' +\n'ol{margin:0;padding-left:20px}li{margin:0 0 9px;overflow-wrap:anywhere}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}' +\n'.meta,.muted{color:var(--muted);font-size:13px}.tag{background:var(--tag);border-radius:10px;padding:1px 7px;font-size:11px}' +\n'.big{font-size:34px;font-weight:700}.big small{font-size:15px;font-weight:400;color:var(--muted)}' +\n'table{width:100%;border-collapse:collapse;margin-top:10px}td{padding:6px 4px;border-top:1px solid var(--line);font-size:14px}' +\n'.alert{background:var(--warn);border-radius:6px;padding:8px 10px;margin-top:10px;font-size:13px}' +\n'</style></head><body><header><h1>Dev Daily Briefing</h1>' +\n'<div class=\"muted\">' + esc(now) + ' &middot; ' + esc(cfg.city.name) + ' &middot; ' + healthy + '/4 sources live &middot; topics: ' + esc(cfg.keywords.join(', ')) + '</div></header>' +\n'<div class=\"grid\"><section class=\"wide\"><h2>Hacker News</h2>' + hnHtml + '</section>' +\n'<section><h2>Rising on GitHub this week</h2>' + ghHtml + '</section>' +\n'<section><h2>Weather &middot; ' + esc(weather.city || cfg.city.name) + '</h2>' + wxHtml + '</section>' +\n'<section><h2>Exchange rates</h2>' + fxHtml + '</section></div></body></html>';\n\nreturn [{ json: { html, healthy } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        600,
+        300
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000014",
+      "name": "Build Dashboard"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        820,
+        300
+      ],
+      "id": "d3b1e000-0000-4000-8000-000000000015",
+      "name": "Return HTML"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Briefing Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "HN Top Stories",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "GitHub Rising Repos",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Weather Forecast",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Exchange Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HN Top Stories": {
+      "main": [
+        [
+          {
+            "node": "Pick Top Stories",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Top Stories": {
+      "main": [
+        [
+          {
+            "node": "Fetch Story",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Story": {
+      "main": [
+        [
+          {
+            "node": "Rank Stories",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Rank Stories": {
+      "main": [
+        [
+          {
+            "node": "Merge Sections",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GitHub Rising Repos": {
+      "main": [
+        [
+          {
+            "node": "Shape Repos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Repos": {
+      "main": [
+        [
+          {
+            "node": "Merge Sections",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Weather Forecast": {
+      "main": [
+        [
+          {
+            "node": "Shape Weather",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Weather": {
+      "main": [
+        [
+          {
+            "node": "Merge Sections",
+            "type": "main",
+            "index": 2
+          }
+        ]
+      ]
+    },
+    "Exchange Rates": {
+      "main": [
+        [
+          {
+            "node": "Shape Rates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape Rates": {
+      "main": [
+        [
+          {
+            "node": "Merge Sections",
+            "type": "main",
+            "index": 3
+          }
+        ]
+      ]
+    },
+    "Merge Sections": {
+      "main": [
+        [
+          {
+            "node": "Build Dashboard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dashboard": {
+      "main": [
+        [
+          {
+            "node": "Return HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "tags": []
+}
